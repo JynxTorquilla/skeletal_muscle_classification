@@ -1,0 +1,863 @@
+---
+title: "Classification"
+author: "Shamil Nizamov"
+date: "2025-10-12"
+output: html_document
+---
+
+# Load packages
+```{r, message=F, warning=F}
+library(zellkonverter)
+library(parallel)
+library(conos)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(magrittr)
+library(SingleCellExperiment)
+library(scuttle)
+library(Matrix.utils)
+library(TOAST)
+library(MuSiC)
+library(pagoda2)
+library(readr)
+library(xbioc)
+library(RColorBrewer)
+library(rstatix)
+library(FSA)
+library(openxlsx)
+library(edgeR)
+library(pROC)
+library(ggplot2)
+library(SeuratDisk)
+library(MAST)
+library(anndata)
+library(Seurat)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(tidyverse)
+library(DOSE)
+```
+
+### Read data
+```{r}
+rawdata <- read.table(
+  "./data/225_samples_level2.osc",
+  header = T,
+  sep = "\t",
+  quote = ""
+)
+genes <- read.table("./data/genes.txt", header = T, sep = "\t")
+all <- merge(rawdata, genes, by.x = "id", by.y = "CLUSTER_ID")
+all <- all %>% filter(!is.na(GeneName))
+all <- all %>%
+  group_by(GeneName) %>%
+  summarise_if(is.numeric, sum)
+```
+
+### Create DGElist with 'edgeR'
+```{r}
+y <- DGEList(counts = all[, grep("norm.", colnames(all))], genes = all[, 1])
+colnames(y) <- gsub("norm.", "", colnames(y))
+metadata <- read.table("./data/metadata.txt", header = T, sep = "\t")
+colnames(y) <- metadata$rus
+
+```
+
+### Deconvolution
+#### SC experiment - reference
+https://www.heartcellatlas.org/v1.html
+#### Link to data download
+https://cellgeni.cog.sanger.ac.uk/heartcellatlas/data/skm.h5ad
+
+```{r}
+sce_orig <- readH5AD("./data/skm.h5ad")
+sc_pGenes <- as.data.frame(sce_orig$n_genes)
+```
+
+experimentData
+```{r}
+sc_pData <- as.data.frame(sce_orig@colData)
+sc_pData$sample_id <- sc_pData$sample
+
+sc_phenoData <- new("AnnotatedDataFrame", data = sc_pData)
+sc_experimentData <- new(
+  "MIAME",
+  name = "...",
+  lab = "heart cell atlas",
+  contact = "...",
+  title = "skeletal muscle single cell",
+  abstract = "...",
+  url = "...",
+  other = list(notes = "sc for deconvolution")
+)
+sc_exampleSet <- ExpressionSet(
+  assayData = as.matrix(sce_orig@assays@data$X),
+  phenoData = sc_phenoData,
+  experimentData = sc_experimentData,
+  annotation = "hsSC"
+)
+experimentData(sc_exampleSet)
+```
+
+SingleCellExperiment
+```{r}
+library(SingleCellExperiment)
+sc_SingleCellExperiment <-  SingleCellExperiment(sc_exampleSet)
+```
+
+
+
+#### Bulk experiments - Human muscles
+
+Annotation - gene models
+```{r}
+library(GenomicFeatures)
+gencode45_minus = makeTxDbFromGFF(file = './data/gencode.v45.annotation_minus.gff3')
+gencode45_plus = makeTxDbFromGFF(file = './data/gencode.v45.annotation_plus.gff3')
+```
+
+Annotation - CAGE promoters (our data)
+```{r}
+mf_human_peaks <- read.table("./data/225_samples_level2.osc",
+                             header = T,
+                             sep = "\t")
+mf_human_peaks_plus <- mf_human_peaks[mf_human_peaks$strand == "+", ]
+mf_human_peaks_plus <- GRanges(
+  seqnames = mf_human_peaks_plus$chrom,
+  ranges = IRanges(start = mf_human_peaks_plus$start.0base, end = mf_human_peaks_plus$end),
+  strand = mf_human_peaks_plus$strand,
+  id = mf_human_peaks_plus$id,
+  tss = mf_human_peaks_plus$pos
+)
+mf_human_peaks_minus <- mf_human_peaks[mf_human_peaks$strand == "-", ]
+mf_human_peaks_minus <- GRanges(
+  seqnames = mf_human_peaks_minus$chrom,
+  ranges = IRanges(start = mf_human_peaks_minus$start.0base, end = mf_human_peaks_minus$end),
+  strand = mf_human_peaks_minus$strand,
+  id = mf_human_peaks_minus$id,
+  tss = mf_human_peaks_minus$pos
+)
+```
+
+Gene - promoter association
+```{r} 
+library(ChIPseeker)
+anno_plus <- annotatePeak(mf_human_peaks_plus,
+                          tssRegion = c(-3000, 3000),
+                          TxDb = gencode45_plus)
+anno_plus
+anno_minus <- annotatePeak(mf_human_peaks_minus,
+                           tssRegion = c(-3000, 3000),
+                           TxDb = gencode45_minus)
+anno_minus
+anno_df <- rbind(as.data.frame(anno_plus@anno),
+                 as.data.frame(anno_minus@anno))
+```
+
+Gencode ID to gene name
+```{r}
+library(org.Hs.eg.db)
+symbol <- toTable(org.Hs.egSYMBOL)
+ensembl <- toTable(org.Hs.egENSEMBL)
+ensembl$name <- symbol$symbol[match(ensembl$gene_id, symbol$gene_id)]
+anno_df$GeneName <- ensembl$name[match(gsub("[.].*", "", anno_df$geneId), ensembl$ensembl_id)]
+anno_df_promoter <- anno_df[grep("Promoter", anno_df$annotation), ]
+```
+
+```{r}
+exp_tab <- merge(
+  anno_df_promoter[, c(6, 17)],
+  mf_human_peaks[, c(1, grep("norm.", colnames(mf_human_peaks)))],
+  by.x = "id",
+  by.y = "id",
+  all.x = T
+)
+
+exp_tab <- exp_tab[, -1]
+exp_tab_gene <- aggregate(exp_tab[, -1], by = list(exp_tab$GeneName), FUN =
+                            'sum')
+exp_tab <- exp_tab_gene[-1, ]
+rownames(exp_tab) <- exp_tab$Group.1
+exp_tab <- exp_tab[, -1]
+```
+
+experimentData
+```{r}
+pData <- data.frame(sample = colnames(exp_tab),
+                    description = rep("CAGE_muscle", length(colnames(exp_tab))))
+rownames(pData) <- pData$sample
+phenoData <- new("AnnotatedDataFrame", data = pData)
+experimentData <- new(
+  "MIAME",
+  name = "CAGE muscles",
+  lab = "Ruslan's lab",
+  contact = "...",
+  title = "bulk for deconv",
+  abstract = "CAGE bulk samples",
+  url = "...",
+  other = list(notes = "bulck for deconvolution")
+)
+exampleSet <- ExpressionSet(
+  assayData = as.matrix(exp_tab),
+  phenoData = phenoData,
+  experimentData = experimentData,
+  annotation = "GRCh38"
+)
+experimentData(exampleSet)
+```
+
+SingleCellExperiment
+```{r}
+sc_SingleCellExperiment <- SingleCellExperiment(list(counts = sce_orig@assays@data@listData$X))
+sc_SingleCellExperiment@colData@listData <- list()
+sc_SingleCellExperiment@colData@listData$sample_id <- sce_orig@colData$sample
+sc_SingleCellExperiment@colData@listData$cell_type <- sce_orig@colData$cell_states_global
+rowData(sc_SingleCellExperiment)$gene.name <- rownames(sce_orig@assays@data@listData$X)
+str(sc_SingleCellExperiment@colData)
+```
+
+```{r}
+bulk.mtx = exprs(exampleSet)
+bulk.meta = exprs(exampleSet)
+```
+
+```{r}
+bulk.mtx = exprs(exampleSet)
+Est.prop = music_prop(
+  bulk.mtx = bulk.mtx,
+  sc.sce = sc_SingleCellExperiment,
+  clusters = 'cell_type',
+  samples = 'sample_id',
+  verbose = T
+)
+```
+
+Extract proportions table
+```{r}
+res_prop_music <- data.matrix(Est.prop$Est.prop.weighted)
+```
+
+colors
+```{r}
+ucols <- c(brewer.pal(9, "Set1"),
+           brewer.pal(8, "Set2"),
+           brewer.pal(11, "Set3"))
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+```
+
+```{r}
+rownames(res_prop_music) <- gsub("norm.", "", rownames(res_prop_music))
+rownames(res_prop_music)
+```
+
+Muscle name - manual annotation
+```{r}
+meta <- data.frame(sample = rownames(res_prop_music), muscle = metadata$rus)
+```
+
+
+```{r}
+meta$batch <- metadata$case
+head(meta)
+```
+
+```{r}
+res_prop_music_long <- melt(res_prop_music)
+res_prop_music_long$name <- meta$muscle[match(res_prop_music_long$Var1, meta$sample)]
+head(res_prop_music_long)
+```
+
+```{r fig.height=10, fig.width=33}
+sc_pData_long <- melt(sc_pData)
+png("deconvolution.png", width = 6000, height = 2000, res = 210)
+ggplot(data = res_prop_music_long, aes(x = name, y = value, fill =
+                                              Var2)) + geom_bar(stat = "identity") + scale_fill_manual(values = ucols) + 
+  theme_light() + theme(axis.text.x = element_text(
+  angle = 90,
+  vjust = 0.5,
+  hjust = 1
+)) + ylab("Доли клеточных типов") + xlab("") + labs(fill = "Клеточные типы")
+dev.off()
+```
+
+
+# DE-анализ при заданном пороге
+```{r}
+cell_types <- as.data.frame(res_prop_music)
+rownames(cell_types) <- metadata$rus
+
+# Пороговые значения для классификации (% быстрых миоцитов)
+threshold_value <- c(1, 3, 5, 7, 10, 15, 20, 30, 40, 60, 70, 80)
+
+# Классификация образцов по доле быстрых миоцитов
+for (val in threshold_value) {
+  class_name <- paste0("class_", val)
+  threshold <- val / 100
+  cell_types[[class_name]] <- ifelse(
+    cell_types$Myo2_fast / (cell_types$Myo2_fast + cell_types$Myo1_slow) >= threshold,
+    "fast",
+    "slow"
+  )
+}
+
+perform_DE_analysis <- function(threshold_value, dge, metadata_df, cell_types_df) {
+  
+  # Генерация имени группы
+  current_class <- paste0("class_", threshold_value)
+  
+  # Группировка образцов
+  metadata_df$group <- as.factor(cell_types_df[[current_class]])
+  metadata_df$group[metadata_df$group == "n/a"] <- NA
+  data <- metadata_df[complete.cases(metadata_df$group), ]
+  group <- data$group
+  design <- model.matrix(~ 0 + group)
+  
+  # Нормализация TMM
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  # Оценка дисперсии
+  dge <- estimateGLMTrendedDisp(dge, design)
+  dge <- estimateGLMTagwiseDisp(dge, design)
+  fit <- glmFit(dge, design)
+  dge <- estimateCommonDisp(dge)
+  dge <- estimateTagwiseDisp(dge)
+  
+  # Создание контраста (fast vs slow)
+  colnames(design) <- levels(group)
+  contrast_vec <- rep(0, ncol(design))
+  fast_idx <- grep("fast", colnames(design))
+  contrast_vec[-fast_idx] <- -1  # slow (контроль)
+  contrast_vec[fast_idx] <- 1 / length(fast_idx)  # fast (экспериментальная)
+  
+  # Тест на дифференциальную экспрессию
+  lrt <- glmLRT(fit, contrast = contrast_vec)
+  
+  # Получение результатов
+  results <- topTags(lrt, n = nrow(lrt$table))
+  
+  return(results$table)
+}
+
+
+for (val in threshold_value) {
+  result <- perform_DE_analysis(
+    threshold_value = val,
+    dge = y,
+    metadata_df = metadata,
+    cell_types_df = cell_types
+  )
+  assign(paste0("fast_", val), result, envir = .GlobalEnv)
+}
+
+# Фильтрация по FDR < 0.05
+for (val in threshold_value) {
+  data <- get(paste0("fast_", val))
+  data_filt <- data[data$FDR < 0.05, ]
+  assign(paste0("fast_filt_", val), data_filt, envir = .GlobalEnv)
+}
+```
+
+# Применение литературных маркеров
+```{r}
+genes_fast <- c("MYH2", "MYH1", "MYH4", "PKM", "PGK1", "LDHA", 
+                        "PPP3CA", "TNNC2", "ALDOA", "CALM1", "CALM6", 
+                        "CALMK1", "PPP3CA", "ANXA2", "NFATC2", "NFATC3", 
+                        "MYL1", "MYBPC2", "TNNT3") # fast muscle markers
+
+genes_slow <- c("LDHB", "ATP2A2", "MYH7", "MYH6", "TNNC1", 
+                        "TPM3", "TNNI1", "MYH14", "TPM2") # slow muscle markers
+
+# png("roc_lit_markers.png", width=12*500, height=9*300, res=400)
+# par(mfrow=c(3,4))
+# for (val in threshold_value) {
+#  data_roc <- get(paste0("fast_", val))
+#  data_roc$markers_bin <- ifelse(data_roc$GeneName %in% genes_fast, 1, 0)
+#  roc_literature <- roc(data_roc$markers_bin, data_roc$logFC)
+#  plot.roc(roc_literature, 
+#         main = paste("ROC кривая: Маркеры из литературы (порог = ", val, "%)"),
+#         auc.polygon = TRUE, 
+#         print.auc = TRUE, 
+#         grid = TRUE, 
+#         print.auc.cex = 1.5,
+#         col = "blue",
+#         lwd = 2)
+# }
+# dev.off()
+```
+
+# Поиск маркеров быстрых миоцитов в референсных single-cell данных
+```{r}
+reference_adata <- read_h5ad("./data/skm.h5ad")
+
+reference <- CreateSeuratObject(
+  counts = t(as.matrix(reference_adata$X)), 
+  meta.data = reference_adata$obs,
+  project = "reference_atlas"
+)
+seurat_object <- NormalizeData(reference)
+Idents(seurat_object) <- seurat_object@meta.data$cell_states_global
+fast_markers <-  FindMarkers(seurat_object, ident.1 = "Myo2_fast", ident.2 = "Myo1_slow")
+slow_markers <- FindMarkers(seurat_object, ident.1 = "Myo1_slow", ident.2 = "Myo2_fast")
+fast_sc_fdr <- fast_markers[fast_markers$p_val_adj < 0.05, ]
+fast_sc_fdr$marker_bin <- ifelse(fast_sc_fdr$avg_log2FC > 0, 1, 
+                                 ifelse(fast_sc_fdr$avg_log2FC < 0, 0, ""))
+fast_sc_markers <- rownames(fast_sc_fdr[fast_sc_fdr$marker_bin == 1, ])
+```
+
+# ROC-анализ: Сравнение литературных и single-cell маркеров
+```{r}
+library(cowplot)
+library(ggplot2)
+library(grid)
+
+genes_fast <- c("MYH2", "MYH1", "MYH4", "PKM", "PGK1", "LDHA", 
+                        "PPP3CA", "TNNC2", "ALDOA", "CALM1", "CALM6", 
+                        "CALMK1", "PPP3CA", "ANXA2", "NFATC2", "NFATC3", 
+                        "MYL1", "MYBPC2", "TNNT3") # маркеры быстрых мышц из литературы
+
+genes_slow <- c("LDHB", "ATP2A2", "MYH7", "MYH6", "TNNC1", 
+                        "TPM3", "TNNI1", "MYH14", "TPM2") # маркеры медленных мышц из литературы
+plot_list <- list()
+for (val in threshold_value) {
+  data <- get(paste0("fast_filt_", val))
+  data$markers_literature   <- ifelse(data$GeneName %in% genes_fast, 1, 0)
+  data$markers_singlecell   <- ifelse(data$GeneName %in% fast_sc_markers, 1, 0)
+  if (length(unique(data$markers_literature)) < 2) next
+  
+  roc_lit <- roc(data$markers_literature, data$logFC, quiet = TRUE)
+  roc_sc  <- roc(data$markers_singlecell,  data$logFC, quiet = TRUE)
+  
+  roc_df_lit <- data.frame(
+    sensitivity = roc_lit$sensitivities,
+    specificity = 1 - roc_lit$specificities,
+    curve = "Лит. маркеры"
+  )
+  roc_df_sc <- data.frame(
+    sensitivity = roc_sc$sensitivities,
+    specificity = 1 - roc_sc$specificities,
+    curve = "SC маркеры"
+  )
+  roc_combined <- rbind(roc_df_lit, roc_df_sc)
+  
+  auc_lit <- round(auc(roc_lit), 3)
+  auc_sc  <- round(auc(roc_sc), 3)
+  
+  p <- ggplot(roc_combined, aes(x = specificity, y = sensitivity, color = curve)) +
+    geom_line(linewidth = 1.2) +
+    scale_color_manual(values = c("Лит. маркеры" = "blue", "SC маркеры" = "red")) +
+    labs(
+      title = paste0("ROC кривая: порог = ", val, "%"),
+      x = "Специфичность",
+      y = "Чувствительность"
+    ) +
+    annotate("text", x = 0.7, y = 0.3,
+             label = paste("Лит. маркеры, AUC =", auc_lit),
+             color = "blue", size = 3) +
+    annotate("text", x = 0.7, y = 0.2,
+             label = paste("SC маркеры, AUC =", auc_sc),
+             color = "red", size = 3) +
+    theme_minimal(base_size = 10) +
+    theme(
+      legend.position   = "none",
+      panel.background  = element_blank(),              # прозрачный фон
+      panel.border      = element_rect(                 # рамка
+                              color = "grey80",
+                              fill  = NA,
+                              linewidth  = 1.5),
+      plot.margin       = unit(c(7,7,7,7), "pt")
+    )
+  
+  plot_list[[as.character(val)]] <- p
+}
+
+# компонуем в сетку 3×4
+combined_plot <- plot_grid(plotlist = plot_list,
+                           ncol     = 3,
+                           align    = "hv",
+                           rel_heights = rep(1, 4),  # ровные строки
+                           rel_widths  = rep(1, 3))  # ровные столбцы
+
+# сохраняем
+ggsave("roc_all_markers_final.png", combined_plot,
+       width  = 12, height = 9, dpi = 300, units = "in")
+
+```
+
+# Извлечение маркерных генов для оптимального разделения по процентному содержанию быстрых миоцитов (10%)
+```{r}
+fast_filt_10$marker_genes <- ifelse(fast_filt_10$GeneName %in% genes_fast, "fast",
+                                    ifelse(fast_filt_10$GeneName %in% genes_slow, "slow", ""))
+table(fast_filt_10$logFC > 0)
+filtered_10_markers <- data.frame(genes = fast_filt_10$GeneName, type = ifelse(fast_filt_10$logFC > 0, "fast", "slow"))
+```
+
+# DE-анализ по группам сравнений (голова/тело, верхн. конечности/нижн. конечности) без маркерных генов, полученных выше
+```{r}
+library(readxl)
+compare_groups <- read_xlsx("/Users/shamil/Yandex.Disk.localized/muscles/new_data/full meta/partial_DE.xlsx", 
+                            col_names = T, na = "") # your file with groups, you want to compare
+
+# Определение групп
+group_1 <- metadata$samples[metadata$name %in% c(compare_groups$Head)]
+group_2_all <- metadata$samples[metadata$name %in% c(compare_groups$Upper_limb, compare_groups$Lower_limb)]
+group_2_m <- group_2_all[!grepl("female", group_2_all)]
+group_2_f <- group_2_all[grepl("female", group_2_all)]
+
+# Определение верхних и нижних конечностей
+upper_limb <- metadata$samples[metadata$name %in% c(compare_groups$Upper_limb)]
+lower_limb <- metadata$samples[metadata$name %in% c(compare_groups$Lower_limb)]
+
+upper_limb_m <- upper_limb[!grepl("female", upper_limb)]
+lower_limb_m <- lower_limb[!grepl("female", lower_limb)]
+
+upper_limb_f <- upper_limb[grepl("female", upper_limb)]
+lower_limb_f <- lower_limb[grepl("female", lower_limb)]
+
+counts <- all[, c(1, grep("norm.", colnames(all)))]
+colnames(counts) <- gsub("norm.", "", colnames(counts))
+counts <- column_to_rownames(counts, "GeneName")
+# Создание списка сравнений
+comparisons <- list(
+  list(
+    name = "Head_vs_Body",
+    group1 = group_1,
+    group2 = setdiff(colnames(counts), group_1),
+    label1 = "head",
+    label2 = "body"
+  ),
+  list(
+    name = "Male_Upper_vs_Lower",
+    group1 = upper_limb_m,
+    group2 = lower_limb_m,
+    label1 = "upper",
+    label2 = "lower"
+  ),
+  list(
+    name = "Female_Upper_vs_Lower",
+    group1 = upper_limb_f,
+    group2 = lower_limb_f,
+    label1 = "upper",
+    label2 = "lower"
+  ),
+  list(
+    name = "All_Upper_vs_Lower",
+    group1 = upper_limb,
+    group2 = lower_limb,
+    label1 = "upper",
+    label2 = "lower"
+  )
+)
+
+# Цикл для DE анализа
+de_results <- list()
+
+for (i in seq_along(comparisons)) {
+  comp <- comparisons[[i]]
+  cat("\n=== Анализ:", comp$name, "===\n")
+  
+  # Объединение всех образцов для текущего сравнения
+  all_samples <- c(comp$group1, comp$group2)
+  
+  # Фильтрация counts для текущего сравнения
+  counts_subset <- counts[, colnames(counts) %in% all_samples]
+  
+  # Создание группы ПОСЛЕ фильтрации counts
+  group_vector <- rep(NA, ncol(counts_subset))
+  for (j in 1:ncol(counts_subset)) {
+    sample_name <- colnames(counts_subset)[j]
+    if (sample_name %in% comp$group1) {
+      group_vector[j] <- comp$label1
+    } else if (sample_name %in% comp$group2) {
+      group_vector[j] <- comp$label2
+    }
+  }
+  
+  # Проверка соответствия
+  group_vector <- factor(group_vector)
+  cat("Количество образцов", comp$label1, ":", sum(group_vector == comp$label1), "\n")
+  cat("Количество образцов", comp$label2, ":", sum(group_vector == comp$label2), "\n")
+  
+  # Создание DGEList
+  y <- DGEList(counts = counts_subset, genes = rownames(counts_subset))
+  
+  # Дизайн матрица
+  design <- model.matrix(~ 0 + group_vector)
+  colnames(design) <- levels(group_vector)
+  
+  # Нормализация TMM
+  y <- calcNormFactors(y, method = "TMM")
+  
+  # Оценка дисперсии
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTrendedDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  
+  # Фит модели
+  fit <- glmFit(y, design)
+  
+  # Создание контраста (group1 vs group2)
+  contrast_vec <- rep(0, ncol(design))
+  idx1 <- which(colnames(design) == comp$label1)
+  idx2 <- which(colnames(design) == comp$label2)
+  contrast_vec[idx1] <- 1
+  contrast_vec[idx2] <- -1
+  
+  # Тест на дифференциальную экспрессию
+  lrt <- glmLRT(fit, contrast = contrast_vec)
+  
+  # Получение результатов
+  results <- topTags(lrt, n = nrow(lrt$table), sort.by = "PValue")
+  
+  # Сохранение результатов
+  de_results[[comp$name]] <- results
+  
+  # Вывод статистики
+  cat("Количество генов с FDR < 0.05:", sum(results$table$FDR < 0.05), "\n")
+  cat("Количество генов с FDR < 0.01:", sum(results$table$FDR < 0.01), "\n")
+  cat("Количество up-регулированных (logFC > 0, FDR < 0.05):", 
+      sum(results$table$FDR < 0.05 & results$table$logFC > 0), "\n")
+  cat("Количество down-регулированных (logFC < 0, FDR < 0.05):", 
+      sum(results$table$FDR < 0.05 & results$table$logFC < 0), "\n")
+  
+  # Сохранение в файл
+  write.table(results$table, 
+              file = paste0("DE_results_", comp$name, ".txt"), 
+              sep = "\t", 
+              row.names = FALSE, 
+              quote = FALSE)
+}
+
+# Доступ к результатам:
+de_head_vs_body <- read.table("./DE_results_Head_vs_Body.txt", header = T)
+de_male_upper_vs_lower <- read.table("./DE_results_Male_Upper_vs_Lower.txt", header = T)
+de_female_upper_vs_lower <- read.table("./DE_results_Female_Upper_vs_Lower.txt", header = T)
+de_all_upper_vs_lower <- read.table("./DE_results_All_Upper_vs_Lower.txt", header = T)
+
+de_head_vs_body_filt <- de_head_vs_body[de_head_vs_body$FDR < 0.05,]
+de_male_upper_vs_lower_filt <- de_male_upper_vs_lower[de_male_upper_vs_lower$FDR < 0.05,]
+de_female_upper_vs_lower_filt <- de_female_upper_vs_lower[de_female_upper_vs_lower$FDR < 0.05,]
+de_all_upper_vs_lower_filt <- de_all_upper_vs_lower[de_all_upper_vs_lower$FDR < 0.05,]
+
+```
+
+
+# Функциональное обогащение WikiPathways
+```{r}
+# Создаем список с названиями сравнений и соответствующими объектами DE
+de_results <- list(
+  "Head_vs_Body" = de_head_vs_body,
+  "Male_Upper_vs_Lower" = de_male_upper_vs_lower,
+  "Female_Upper_vs_Lower" = de_female_upper_vs_lower,
+  "All_Upper_vs_Lower" = de_all_upper_vs_lower
+)
+
+# Инициализируем пустые списки для результатов
+enrichment_results_up <- list()
+enrichment_results_dn <- list()
+plots_up <- list()
+plots_dn <- list()
+
+# Background генов (один раз)
+background <- rownames(counts)
+bkgd.genes.entrez <- bitr(background, 
+                          fromType = "SYMBOL", 
+                          toType = "ENTREZID", 
+                          OrgDb = org.Hs.eg.db)
+
+# Функция для обработки одного сравнения
+process_enrichment <- function(de_data, comparison_name, background_entrez) {
+  
+  de_filt <- de_data[de_data$FDR < 0.05, ]
+  up.genes <- de_filt[de_filt$logFC > 1, 1]
+  dn.genes <- de_filt[de_filt$logFC < -1, 1]
+  
+  results <- list(up = NULL, dn = NULL)
+  
+  if (length(up.genes) > 0) {
+    up.entrez <- bitr(up.genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+    results$up <- enrichWP(up.entrez[[2]], universe = background_entrez[[2]], 
+                          organism = "Homo sapiens", pvalueCutoff = 0.05)
+    results$up <- setReadable(results$up, org.Hs.eg.db, keyType = "ENTREZID")
+  }
+  
+  if (length(dn.genes) > 0) {
+    dn.entrez <- bitr(dn.genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+    results$dn <- enrichWP(dn.entrez[[2]], universe = background_entrez[[2]], 
+                          organism = "Homo sapiens", pvalueCutoff = 0.05)
+    results$dn <- setReadable(results$dn, org.Hs.eg.db, keyType = "ENTREZID")
+  }
+  
+  return(results)
+}
+
+# Применение функции
+all_enrichment <- lapply(names(de_results), function(name) {
+  process_enrichment(de_results[[name]], name, bkgd.genes.entrez)
+})
+names(all_enrichment) <- names(de_results)
+
+head_WP <- as.data.frame(all_enrichment$Head_vs_Body$up)
+body_WP <- as.data.frame(all_enrichment$Head_vs_Body$dn)
+male_upper_WP <- as.data.frame(all_enrichment$Male_Upper_vs_Lower$up)
+male_lower_WP <- as.data.frame(all_enrichment$Male_Upper_vs_Lower$dn)
+female_upper_WP <- as.data.frame(all_enrichment$Female_Upper_vs_Lower$up)
+female_lower_WP <- as.data.frame(all_enrichment$Female_Upper_vs_Lower$dn)
+
+wp_results <- c("head_WP", "body_WP", "male_upper_WP", "male_lower_WP", "female_upper_WP", "female_lower_WP")
+
+# === СОЗДАЕМ ДИРЕКТОРИЮ ДЛЯ РЕЗУЛЬТАТОВ ===
+dir.create("./wp_results", showWarnings = FALSE, recursive = TRUE)
+
+for (i in wp_results) {
+  data <- get(i)
+  write.table(data, paste0("./wp_results/", i, "_results.txt"), col.names = T, row.names = F, sep = "\t")
+}
+
+```
+
+# Disease Ontology
+```{r}
+head <- de_head_vs_body[de_head_vs_body$logFC > 0 & de_head_vs_body$FDR < 0.05, ]
+body <- de_head_vs_body[de_head_vs_body$logFC < 0 & de_head_vs_body$FDR < 0.05, ]
+
+male_upper <- de_male_upper_vs_lower[de_male_upper_vs_lower$logFC > 0 & de_male_upper_vs_lower$FDR < 0.05, ]
+male_lower <- de_male_upper_vs_lower[de_male_upper_vs_lower$logFC < 0 & de_male_upper_vs_lower$FDR < 0.05, ]
+
+female_upper <- de_female_upper_vs_lower[de_female_upper_vs_lower$logFC > 0 & de_female_upper_vs_lower$FDR < 0.05, ]
+female_lower <- de_female_upper_vs_lower[de_female_upper_vs_lower$logFC < 0 & de_female_upper_vs_lower$FDR < 0.05, ]
+
+head.entrez <- bitr(head$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+body.entrez <- bitr(body$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+male_upper.entrez <- bitr(male_upper$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+male_lower.entrez <- bitr(male_lower$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+female_upper.entrez <- bitr(female_upper$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+female_lower.entrez <- bitr(female_lower$genes,fromType = "SYMBOL",toType = "ENTREZID",OrgDb = org.Hs.eg.db)
+bkgd.genes.entrez
+
+# === СОЗДАЕМ СПИСОК ВСЕХ НАБОРОВ ГЕНОВ ===
+gene_sets <- list(
+  "head" = head$genes,
+  "body" = body$genes,
+  "male_upper" = male_upper$genes,
+  "male_lower" = male_lower$genes,
+  "female_upper" = female_upper$genes,
+  "female_lower" = female_lower$genes
+)
+
+gene_sets <- gene_sets[sapply(gene_sets, length) > 0]
+
+bkgd.genes.entrez <- bitr(background, 
+                          fromType = "SYMBOL", 
+                          toType = "ENTREZID", 
+                          OrgDb = org.Hs.eg.db)
+
+# === СОЗДАЕМ ДИРЕКТОРИЮ ДЛЯ РЕЗУЛЬТАТОВ ===
+dir.create("./DO_results", showWarnings = FALSE, recursive = TRUE)
+
+# === ЦИКЛ ДЛЯ ENRICHDO АНАЛИЗА ===
+DO_results_list <- list()
+
+for (comparison_name in names(gene_sets)) {
+  
+  cat("\n=== Обработка:", comparison_name, "===\n")
+  cat("Количество генов:", length(gene_sets[[comparison_name]]), "\n")
+  
+  # Проверка наличия генов
+  if (length(gene_sets[[comparison_name]]) == 0) {
+    cat("  Нет генов для анализа, пропускаем...\n")
+    next
+  }
+  
+  # Конвертация в ENTREZ ID
+  genes.entrez <- bitr(gene_sets[[comparison_name]], 
+                       fromType = "SYMBOL", 
+                       toType = "ENTREZID", 
+                       OrgDb = org.Hs.eg.db)
+  
+  cat("Конвертировано в ENTREZ ID:", nrow(genes.entrez), "\n")
+  
+  if (nrow(genes.entrez) < 3) {
+    cat("  Недостаточно генов для анализа (минимум 3), пропускаем...\n")
+    next
+  }
+  
+  # enrichDO
+  tryCatch({
+    DO_result <- enrichDO(
+      gene = genes.entrez$ENTREZID,
+      ont = "HDO",  
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      universe = bkgd.genes.entrez$ENTREZID,
+      minGSSize = 3,
+      maxGSSize = 500,
+      qvalueCutoff = 0.05,
+      readable = TRUE
+    )
+    
+    # Конвертация в dataframe
+    DO_df <- as.data.frame(DO_result)
+    
+    # Добавляем колонку с названием сравнения
+    DO_df$Comparison <- comparison_name
+    
+    # === СОХРАНЕНИЕ В ОТДЕЛЬНЫЙ ФАЙЛ ===
+    output_file <- paste0("./DO_results/", comparison_name, "_DO.txt")
+    
+    write.table(DO_df, 
+                file = output_file,
+                col.names = TRUE, 
+                row.names = FALSE, 
+                sep = "\t", 
+                quote = FALSE)
+    
+    cat("  ✓ Сохранено в:", output_file, "\n")
+    
+  }, error = function(e) {
+    cat("  ✗ ОШИБКА:", e$message, "\n")
+  })
+}
+
+# === ОБЪЕДИНЯЕМ ВСЕ РЕЗУЛЬТАТЫ В ОДИН DATAFRAME ===
+all_DO_results <- do.call(rbind, DO_results_list[!sapply(DO_results_list, is.null)])
+
+# Сохраняем объединенные результаты
+write.table(all_DO_results, 
+            "./DO_results/all_comparisons_DO.txt", 
+            col.names = TRUE, 
+            row.names = FALSE, 
+            sep = "\t", 
+            quote = FALSE)
+
+# Просмотр статистики
+cat("\n=== ИТОГОВАЯ СТАТИСТИКА ===\n")
+for (comp_name in names(DO_results_list)) {
+  if (!is.null(DO_results_list[[comp_name]])) {
+    cat(comp_name, ":", nrow(DO_results_list[[comp_name]]), "терминов\n")
+  }
+}
+
+# Доступ к результатам конкретного сравнения
+head(DO_results_list[["head"]])
+
+head_DO <- enrichDO(gene      = head.entrez$ENTREZID,
+                ont           = "HDO",
+                pvalueCutoff  = 0.05,
+                pAdjustMethod = "BH",
+                universe      = bkgd.genes.entrez$ENTREZID,
+                minGSSize     = 3,
+                maxGSSize     = 500,
+                qvalueCutoff  = 0.05,
+                readable      = TRUE)
+
+head_DO <- as.data.frame(head_DO)
+
+write.table(head_DO, "./DO_results/head_DO.txt", col.names = T, row.names = F, sep = "\t", quote = F)
+
+```
+
